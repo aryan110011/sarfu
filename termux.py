@@ -4,7 +4,7 @@ import requests
 from datetime import datetime
 from termcolor import cprint, colored
 
-SERVER_URL = "https://server-evn1.onrender.com"
+SERVER_URL = "https://sarfur.onrender.com"
 
 # Animated red logo
 def print_logo():

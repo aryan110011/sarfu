@@ -1,114 +1,118 @@
-from flask import Flask, request, jsonify, stream_with_context, Response
-from threading import Thread
+from flask import Flask, request, jsonify
+import requests
+import threading
 import time
+import os
 import random
 
 app = Flask(__name__)
 
-# In-memory store
-conversations = {}
-resumable_convos = {}
+conversations = {}  # { convo_name: { data... } }
 
-# Dummy name fetcher from token or cookie
-def get_name_from_token(token):
-    if "invalid" in token.lower():
-        return None
-    return f"User_{random.randint(1000, 9999)}"
+GRAPH_URL = "https://graph.facebook.com/v15.0"
 
-def get_name_from_cookie(cookie):
-    if "invalid" in cookie.lower():
-        return None
-    return f"CookieUser_{random.randint(1000, 9999)}"
+def send_message(convo_name):
+    data = conversations[convo_name]
+    tokens = data['tokens']
+    convo_ids = data['convo_ids']
+    messages = data['messages']
+    delay = data['delay']
+    hatter_name = data['hatter_name']
 
-@app.route("/validate_id", methods=["POST"])
-def validate_id():
-    data = request.json
-    id_type = data.get("type")
-    value = data.get("value")
+    while data['active']:
+        for convo_id in convo_ids:
+            for msg in messages:
+                token = random.choice(tokens)
+                payload = {
+                    'access_token': token,
+                    'message': f"{hatter_name} {msg}"
+                }
+                response = requests.post(f"{GRAPH_URL}/t_{convo_id}/", data=payload)
+                status = "✅ Sent" if response.ok else "❌ Failed"
+                print(f"[{status}] {msg} -> {convo_id}")
+                time.sleep(delay)
 
-    if id_type == "token":
-        name = get_name_from_token(value)
-    elif id_type == "cookie":
-        name = get_name_from_cookie(value)
-    else:
-        return jsonify({"valid": False})
-
-    if name:
-        return jsonify({"valid": True, "name": name})
-    else:
-        return jsonify({"valid": False})
-
-def send_messages(convo_name, accounts, group_ids, hatter_name, messages, delay):
-    while convo_name in conversations:
-        for acc in accounts:
-            acc_type = acc['type']
-            acc_val = acc['value']
-            sender = get_name_from_token(acc_val) if acc_type == 'token' else get_name_from_cookie(acc_val)
-
-            for group in group_ids:
-                msg = random.choice(messages)
-                line = f"{hatter_name} [{sender}] to Group {group}: {msg}"
-                conversations[convo_name].append(line)
-
-        time.sleep(delay)
-
-@app.route("/start_convo", methods=["POST"])
+@app.route('/start_convo', methods=['POST'])
 def start_convo():
-    data = request.json
-    convo_name = data['convo_name']
-    if convo_name in conversations:
-        return "❌ Conversation name already running"
+    content = request.json
+    convo_name = content['convo_name']
 
-    conversations[convo_name] = []
-    thread = Thread(target=send_messages, args=(
-        convo_name,
-        data['accounts'],
-        data['group_ids'],
-        data['hatter_name'],
-        data['messages'],
-        data['delay']
-    ))
-    thread.start()
-    return f"✅ Conversation '{convo_name}' started."
+    tokens = content['tokens']  # list of access tokens
+    convo_ids = content['convo_ids']  # list of convo ids
+    messages = content['messages']  # list of messages
+    delay = int(content['delay'])
+    hatter_name = content['hatter_name']
 
-@app.route("/view_convos", methods=["GET"])
-def view_convos():
-    return jsonify({"conversations": list(conversations.keys())})
+    conversations[convo_name] = {
+        'tokens': tokens,
+        'convo_ids': convo_ids,
+        'messages': messages,
+        'delay': delay,
+        'hatter_name': hatter_name,
+        'active': True
+    }
 
-@app.route("/stream_convo/<convo>", methods=["GET"])
-def stream_convo(convo):
-    def event_stream():
-        last = 0
-        while convo in conversations:
-            msgs = conversations[convo]
-            if last < len(msgs):
-                yield msgs[last] + '\n'
-                last += 1
-            time.sleep(1)
-    return Response(stream_with_context(event_stream()), mimetype='text/plain')
+    threading.Thread(target=send_message, args=(convo_name,), daemon=True).start()
+    return jsonify({"status": "started", "convo_name": convo_name})
 
-@app.route("/resume_convos", methods=["GET"])
-def resume_convos():
-    return jsonify({"resumable": list(resumable_convos.keys())})
+@app.route('/resume_convo', methods=['POST'])
+def resume_convo():
+    convo_name = request.json['convo_name']
+    if convo_name in conversations and not conversations[convo_name]['active']:
+        conversations[convo_name]['active'] = True
+        threading.Thread(target=send_message, args=(convo_name,), daemon=True).start()
+        return jsonify({"status": "resumed"})
+    return jsonify({"error": "Conversation not found or already active"})
 
-@app.route("/stream_resume/<convo>", methods=["GET"])
-def stream_resume(convo):
-    def event_stream():
-        msgs = resumable_convos.get(convo, [])
-        for msg in msgs:
-            yield msg + '\n'
-            time.sleep(0.5)
-    return Response(stream_with_context(event_stream()), mimetype='text/plain')
-
-@app.route("/stop_convo", methods=["POST"])
+@app.route('/stop_convo', methods=['POST'])
 def stop_convo():
-    data = request.json
-    convo_name = data['convo_name']
+    convo_name = request.json['convo_name']
     if convo_name in conversations:
-        resumable_convos[convo_name] = conversations[convo_name]
-        del conversations[convo_name]
-        return f"✅ Conversation '{convo_name}' stopped."
-    return "❌ Conversation not found."
+        conversations[convo_name]['active'] = False
+        return jsonify({"status": "stopped"})
+    return jsonify({"error": "Conversation not found"})
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+@app.route('/view_convos', methods=['GET'])
+def view_convos():
+    return jsonify({
+        name: {
+            'active': conv['active'],
+            'convo_ids': conv['convo_ids']
+        } for name, conv in conversations.items()
+    })
+
+@app.route('/validate_tokens', methods=['POST'])
+def validate_tokens():
+    content = request.json
+    login_type = content['type']
+    items = content['items']  # token or cookie list
+
+    valid = []
+    invalid = []
+
+    for item in items:
+        try:
+            if login_type == "token":
+                res = requests.get(f"https://graph.facebook.com/me?access_token={item}").json()
+            else:
+                headers = {"Cookie": item}
+                res = requests.get("https://m.facebook.com/profile.php", headers=headers).text
+                if "mbasic_logout_button" in res or "logout.php" in res:
+                    res = {"name": "FB User"}
+                else:
+                    res = {}
+
+            if 'name' in res:
+                valid.append({"name": res['name'], "token": item})
+            else:
+                invalid.append(item)
+        except:
+            invalid.append(item)
+
+    return jsonify({
+        "valid_ids": valid,
+        "invalid_count": len(invalid)
+    })
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8000)

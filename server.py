@@ -1,118 +1,117 @@
 from flask import Flask, request, jsonify
-import requests
 import threading
 import time
-import os
-import random
+import requests
 
 app = Flask(__name__)
 
-conversations = {}  # { convo_name: { data... } }
+conversations = {}
 
-GRAPH_URL = "https://graph.facebook.com/v15.0"
-
-def send_message(convo_name):
-    data = conversations[convo_name]
-    tokens = data['tokens']
-    convo_ids = data['convo_ids']
-    messages = data['messages']
-    delay = data['delay']
-    hatter_name = data['hatter_name']
-
-    while data['active']:
-        for convo_id in convo_ids:
-            for msg in messages:
-                token = random.choice(tokens)
-                payload = {
-                    'access_token': token,
-                    'message': f"{hatter_name} {msg}"
-                }
-                response = requests.post(f"{GRAPH_URL}/t_{convo_id}/", data=payload)
-                status = "✅ Sent" if response.ok else "❌ Failed"
-                print(f"[{status}] {msg} -> {convo_id}")
-                time.sleep(delay)
-
-@app.route('/start_convo', methods=['POST'])
-def start_convo():
-    content = request.json
-    convo_name = content['convo_name']
-
-    tokens = content['tokens']  # list of access tokens
-    convo_ids = content['convo_ids']  # list of convo ids
-    messages = content['messages']  # list of messages
-    delay = int(content['delay'])
-    hatter_name = content['hatter_name']
-
-    conversations[convo_name] = {
-        'tokens': tokens,
-        'convo_ids': convo_ids,
-        'messages': messages,
-        'delay': delay,
-        'hatter_name': hatter_name,
-        'active': True
-    }
-
-    threading.Thread(target=send_message, args=(convo_name,), daemon=True).start()
-    return jsonify({"status": "started", "convo_name": convo_name})
-
-@app.route('/resume_convo', methods=['POST'])
-def resume_convo():
-    convo_name = request.json['convo_name']
-    if convo_name in conversations and not conversations[convo_name]['active']:
-        conversations[convo_name]['active'] = True
-        threading.Thread(target=send_message, args=(convo_name,), daemon=True).start()
-        return jsonify({"status": "resumed"})
-    return jsonify({"error": "Conversation not found or already active"})
-
-@app.route('/stop_convo', methods=['POST'])
-def stop_convo():
-    convo_name = request.json['convo_name']
-    if convo_name in conversations:
-        conversations[convo_name]['active'] = False
-        return jsonify({"status": "stopped"})
-    return jsonify({"error": "Conversation not found"})
-
-@app.route('/view_convos', methods=['GET'])
-def view_convos():
-    return jsonify({
-        name: {
-            'active': conv['active'],
-            'convo_ids': conv['convo_ids']
-        } for name, conv in conversations.items()
-    })
-
-@app.route('/validate_tokens', methods=['POST'])
-def validate_tokens():
-    content = request.json
-    login_type = content['type']
-    items = content['items']  # token or cookie list
-
+# Improved Token/Cookie Validator
+def validate_ids(login_type, id_list):
     valid = []
     invalid = []
-
-    for item in items:
-        try:
-            if login_type == "token":
-                res = requests.get(f"https://graph.facebook.com/me?access_token={item}").json()
-            else:
+    for item in id_list:
+        if login_type == "token":
+            try:
+                check = requests.get(f"https://graph.facebook.com/me?access_token={item}")
+                data = check.json()
+                if 'error' in data:
+                    invalid.append(item)
+                else:
+                    valid.append({"name": data.get('name', 'FB User'), "token": item})
+            except Exception as e:
+                print(f"Error validating token: {e}")
+                invalid.append(item)
+        else:
+            try:
                 headers = {"Cookie": item}
                 res = requests.get("https://m.facebook.com/profile.php", headers=headers).text
                 if "mbasic_logout_button" in res or "logout.php" in res:
-                    res = {"name": "FB User"}
+                    valid.append({"name": "FB User", "token": item})
                 else:
-                    res = {}
-
-            if 'name' in res:
-                valid.append({"name": res['name'], "token": item})
-            else:
+                    invalid.append(item)
+            except Exception as e:
+                print(f"Error validating cookie: {e}")
                 invalid.append(item)
-        except:
-            invalid.append(item)
+    return valid, invalid
 
-    return jsonify({
-        "valid_ids": valid,
-        "invalid_count": len(invalid)
-    })
+def send_messages(convo_name):
+    convo = conversations[convo_name]
+    while convo['active']:
+        for message in convo['messages']:
+            for token_info in convo['ids']:
+                token = token_info['token']
+                headers = {'Content-Type': 'application/json'}
+                payload = {
+                    'access_token': token,
+                    'message': convo['hatter'] + ' ' + message
+                }
+                try:
+                    response = requests.post(
+                        f"https://graph.facebook.com/v15.0/t_{convo['convo_id']}/",
+                        json=payload,
+                        headers=headers
+                    )
+                    print(f"[+] Sent: {message} | By: {token_info['name']} | Status: {response.status_code}")
+                except Exception as e:
+                    print(f"[x] Error sending: {message} | By: {token_info['name']} | Error: {e}")
+                time.sleep(convo['delay'])
+        print("[+] All messages sent. Restarting loop...")
+
+@app.route('/start_convo', methods=['POST'])
+def start_convo():
+    data = request.json
+    convo_name = data['convo_name']
+    login_type = data['login_type']
+    id_list = data['ids']
+    convo_id = data['convo_id']
+    hatter = data['hatter']
+    messages = data['messages']
+    delay = int(data['delay'])
+
+    valid, invalid = validate_ids(login_type, id_list)
+    if not valid:
+        return jsonify({"status": "error", "message": "No valid IDs found.", "invalid_count": len(invalid)})
+
+    conversations[convo_name] = {
+        'convo_id': convo_id,
+        'hatter': hatter,
+        'messages': messages,
+        'delay': delay,
+        'ids': valid,
+        'active': True
+    }
+
+    thread = threading.Thread(target=send_messages, args=(convo_name,))
+    thread.start()
+
+    return jsonify({"status": "started", "valid": valid, "invalid_count": len(invalid)})
+
+@app.route('/stop_convo', methods=['POST'])
+def stop_convo():
+    data = request.json
+    convo_name = data['convo_name']
+    if convo_name in conversations:
+        conversations[convo_name]['active'] = False
+        return jsonify({"status": "stopped"})
+    return jsonify({"status": "not_found"})
+
+@app.route('/resume_convo', methods=['POST'])
+def resume_convo():
+    data = request.json
+    convo_name = data['convo_name']
+    if convo_name in conversations:
+        conversations[convo_name]['active'] = True
+        thread = threading.Thread(target=send_messages, args=(convo_name,))
+        thread.start()
+        return jsonify({"status": "resumed"})
+    return jsonify({"status": "not_found"})
+
+@app.route('/view_convos', methods=['GET'])
+def view_convos():
+    result = {name: {k: v for k, v in convo.items() if k != 'ids'} for name, convo in conversations.items()}
+    return jsonify(result)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000)
+    app.run(host='0.0.0.0', port=5000)
